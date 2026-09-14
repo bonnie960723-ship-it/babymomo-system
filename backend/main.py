@@ -12,7 +12,7 @@ import csv
 from openpyxl import load_workbook
 
 from database import engine, get_db, Base
-from models import User, Measurement, AuditLog
+from models import User, Measurement, AuditLog, Alert
 from schemas import (
     UserCreate, UserOut, Token, MeasurementCreate, MeasurementOut,
     StatsOut, ImportResult
@@ -21,7 +21,8 @@ from auth import (
     get_password_hash, verify_password, create_access_token,
     get_current_user, require_roles, get_user_by_username, ACCESS_TOKEN_EXPIRE_MINUTES
 )
-from utils import calc_bmi, judge_sarcopenia, normalize_measure_time
+from utils import calc_bmi, judge_sarcopenia, normalize_measure_time, format_alert_message, bp_status
+from line_notify import send_line_text, line_configured
 
 # ---------- App ----------
 app = FastAPI(
@@ -47,16 +48,18 @@ def on_startup():
     db = next(get_db())
     try:
         # 僅保留兩個指定管理員；移除舊的預設帳號
-        allowed = {"bonnie", "chrisavicii"}
         for old in db.query(User).all():
-            if old.username not in allowed:
+            if old.username not in {"bonnie", "chrisavicii", "nurse1", "care1"}:
                 db.delete(old)
         db.commit()
 
         defaults = [
             ("bonnie", "Aa960723", "Bonnie (系統管理員)", "superadmin", "Bonnie960723@gmail.com"),
             ("chrisavicii", "Aa0965652118", "Chris (超級管理員)", "superadmin", "chrisw516jn@gmail.com"),
+            ("nurse1", "Nurse1234", "護理師小美", "nurse", None),
+            ("care1", "Care1234", "照顧服務員小華", "caregiver", None),
         ]
+        allowed = {"bonnie", "chrisavicii", "nurse1", "care1"}
         for username, pwd, display, role, email in defaults:
             existing = get_user_by_username(db, username)
             if existing:
@@ -82,6 +85,49 @@ def on_startup():
 def add_audit(db: Session, operator: str, action: str, details: str = ""):
     db.add(AuditLog(operator=operator, action=action, details=details))
     db.commit()
+
+
+def create_abnormal_alert(db: Session, rec: Measurement):
+    """身體數據異常時，建立通報給護理師與照顧服務員。"""
+    if not rec:
+        return None
+    # 無異常不通報
+    stage = rec.sarcopenia_stage or "正常"
+    abn = rec.abnormal_count or 0
+    if abn <= 0 and stage == "正常":
+        return None
+
+    if stage == "嚴重肌少症" or abn >= 3:
+        severity = "critical"
+        title = f"【緊急】{rec.user_name} 身體數據多重異常"
+    elif stage in ("肌少症", "肌少症前期") or abn >= 1:
+        severity = "warning"
+        title = f"【注意】{rec.user_name} 檢測異常需關懷"
+    else:
+        severity = "info"
+        title = f"【提醒】{rec.user_name} 指標需追蹤"
+
+    message = format_alert_message(rec)
+
+    alert = Alert(
+        measurement_id=rec.id,
+        id_card=rec.id_card,
+        user_name=rec.user_name,
+        severity=severity,
+        title=title,
+        message=message,
+        sarcopenia_stage=stage,
+        abnormal_count=abn,
+        target_roles="nurse,caregiver,superadmin,admin",
+    )
+    db.add(alert)
+    db.commit()
+    db.refresh(alert)
+    try:
+        send_line_text(message)
+    except Exception:
+        pass
+    return alert
 
 
 # ========== Auth ==========
@@ -171,6 +217,7 @@ def create_measurement(
     db.add(rec)
     db.commit()
     db.refresh(rec)
+    create_abnormal_alert(db, rec)
     add_audit(db, current_user.username, "create_measurement", f"{payload.id_card} {measure_time}")
     return rec
 
@@ -417,6 +464,8 @@ async def import_file(
                 created_by=current_user.username,
             )
             db.add(rec)
+            db.flush()
+            create_abnormal_alert(db, rec)
             success += 1
         except Exception as e:
             failed += 1
@@ -612,35 +661,187 @@ def get_case(
     }
 
 
+
+# ========== Alerts 異常通報 ==========
+@app.get("/api/alerts", tags=["Alerts"])
+def list_alerts(
+    only_unread: bool = False,
+    only_unhandled: bool = False,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    q = db.query(Alert)
+    # 依角色過濾：護理師/照顧服務員只看目標含自己角色的通報
+    role = current_user.role or "staff"
+    if role not in ("superadmin", "admin", "company_admin"):
+        # SQLite 用 like 過濾 target_roles
+        q = q.filter(Alert.target_roles.ilike(f"%{role}%"))
+    if only_unread:
+        q = q.filter(Alert.is_read == False)
+    if only_unhandled:
+        q = q.filter(Alert.is_handled == False)
+    total = q.count()
+    items = (
+        q.order_by(Alert.created_at.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+    return {
+        "total": total,
+        "unread": db.query(Alert).filter(Alert.is_read == False).count(),
+        "unhandled": db.query(Alert).filter(Alert.is_handled == False).count(),
+        "page": page,
+        "items": [
+            {
+                "id": a.id,
+                "measurement_id": a.measurement_id,
+                "id_card": a.id_card,
+                "user_name": a.user_name,
+                "severity": a.severity,
+                "title": a.title,
+                "message": a.message,
+                "sarcopenia_stage": a.sarcopenia_stage,
+                "abnormal_count": a.abnormal_count,
+                "is_read": a.is_read,
+                "is_handled": a.is_handled,
+                "handled_by": a.handled_by,
+                "handle_note": a.handle_note,
+                "created_at": a.created_at.isoformat() if a.created_at else None,
+                "vitals": _vitals_for_alert(db, a),
+            }
+            for a in items
+        ],
+    }
+
+
+def _vitals_for_alert(db: Session, a: Alert) -> dict:
+    rec = None
+    if a.measurement_id:
+        rec = db.query(Measurement).filter(Measurement.id == a.measurement_id).first()
+    if not rec:
+        rec = (
+            db.query(Measurement)
+            .filter(Measurement.id_card == a.id_card)
+            .order_by(Measurement.measure_time.desc())
+            .first()
+        )
+    if not rec:
+        return {}
+    return {
+        "gender": rec.gender,
+        "age": rec.age,
+        "height": rec.height,
+        "weight": rec.weight,
+        "bmi": rec.bmi,
+        "body_fat": rec.body_fat,
+        "smi": rec.smi,
+        "systolic": rec.systolic,
+        "diastolic": rec.diastolic,
+        "pulse": rec.pulse,
+        "grip_strength": rec.grip_strength,
+        "chair_stand_time": rec.chair_stand_time,
+        "walking_time": rec.walking_time,
+        "bp_status": bp_status(rec.systolic, rec.diastolic),
+        "measure_time": rec.measure_time,
+    }
+
+
+@app.post("/api/alerts/{alert_id}/read", tags=["Alerts"])
+def mark_alert_read(
+    alert_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from datetime import datetime, timezone
+    a = db.query(Alert).get(alert_id)
+    if not a:
+        raise HTTPException(404, "找不到通報")
+    a.is_read = True
+    a.read_by = current_user.username
+    a.read_at = datetime.now(timezone.utc)
+    db.commit()
+    return {"ok": True}
+
+
+@app.post("/api/alerts/{alert_id}/handle", tags=["Alerts"])
+def handle_alert(
+    alert_id: int,
+    note: str = "",
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from datetime import datetime, timezone
+    a = db.query(Alert).get(alert_id)
+    if not a:
+        raise HTTPException(404, "找不到通報")
+    a.is_read = True
+    a.is_handled = True
+    a.handled_by = current_user.username
+    a.handled_at = datetime.now(timezone.utc)
+    a.handle_note = note or "已關懷處理"
+    if not a.read_by:
+        a.read_by = current_user.username
+        a.read_at = a.handled_at
+    db.commit()
+    add_audit(db, current_user.username, "handle_alert", f"alert={alert_id} {a.user_name}")
+    return {"ok": True}
+
+
+@app.post("/api/alerts/{alert_id}/line", tags=["Alerts"])
+def send_alert_to_line(
+    alert_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    a = db.query(Alert).get(alert_id)
+    if not a:
+        raise HTTPException(404, "找不到通報")
+    result = send_line_text(a.message or a.title)
+    add_audit(db, current_user.username, "line_alert", f"alert={alert_id} ok={result.get('ok')}")
+    return result
+
+
+@app.post("/api/alerts/line-test", tags=["Alerts"])
+def send_line_test(current_user: User = Depends(get_current_user)):
+    """先送一筆模擬異常資料。未設定 LINE Token 時只回傳預覽，不會真的發到個人 LINE ID。"""
+    sample = (
+        "【寶貝機模擬通報】\n"
+        "個案：王小明（A123456789）\n"
+        "性別/年齡：男 / 72 歲\n"
+        "檢測時間：2026-09-14 10:00:00\n"
+        "身高/體重：168 cm / 65 kg\n"
+        "BMI：23.0\n"
+        "握力：16.2 kg（不足）\n"
+        "五次坐站：14.8 秒（偏慢）\n"
+        "走路時間：22.1 秒（偏慢）\n"
+        "SMI：6.4（偏低）\n"
+        "血壓：168/98 mmHg（血壓偏高）\n"
+        "脈搏：88 bpm\n"
+        "肌少症分期：嚴重肌少症\n"
+        "異常項目數：4\n"
+        "說明：這是測試訊息，用來確認 LINE 通報格式。\n"
+        f"操作者：{current_user.username}"
+    )
+    result = send_line_text(sample)
+    result["configured"] = line_configured()
+    result["note"] = (
+        "LINE 無法用一般 ID（例如 chrischuang1118）直接傳訊。"
+        "請建立 LINE 官方帳號 Messaging API，把 Channel Access Token 與你的 userId 設到 Railway 變數後才會真的送到 LINE。"
+    )
+    return result
+
+
 # ========== Health check ==========
 @app.get("/api/health", tags=["System"])
 def health():
     return {"status": "ok", "service": "寶貝機體適能檢測系統"}
 
 
+# 掛載前端靜態檔（若存在）
 import os
-
-BASE_DIR = os.path.dirname(__file__)
-FRONTEND_CANDIDATES = [
-    os.path.join(BASE_DIR, "frontend"),
-    os.path.join(BASE_DIR, "..", "frontend"),
-    BASE_DIR,
-]
-
-def _find_frontend():
-    for path in FRONTEND_CANDIDATES:
-        if os.path.isfile(os.path.join(path, "index.html")):
-            return path
-    return None
-
-frontend_path = _find_frontend()
-
-@app.get("/")
-def home_page():
-    if frontend_path:
-        return FileResponse(os.path.join(frontend_path, "index.html"))
-    return {"detail": "Frontend not found. Please upload index.html into backend folder."}
-
-if frontend_path:
+frontend_path = os.path.join(os.path.dirname(__file__), "..", "frontend")
+if os.path.isdir(frontend_path):
     app.mount("/", StaticFiles(directory=frontend_path, html=True), name="frontend")
-    

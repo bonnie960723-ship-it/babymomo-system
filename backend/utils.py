@@ -66,6 +66,45 @@ def judge_sarcopenia(
     return stage, len(issues), status
 
 
+def bp_status(systolic, diastolic) -> str:
+    if systolic is None or diastolic is None:
+        return "未量測"
+    if systolic >= 180 or diastolic >= 120:
+        return "高血壓危急"
+    if systolic >= 160 or diastolic >= 100:
+        return "血壓偏高（需關懷）"
+    if systolic >= 140 or diastolic >= 90:
+        return "血壓偏高"
+    if systolic < 90 or diastolic < 60:
+        return "血壓偏低"
+    return "血壓正常"
+
+
+def format_alert_message(rec) -> str:
+    """組成通報與 LINE 訊息內容。"""
+    stage = getattr(rec, "sarcopenia_stage", None) or "正常"
+    abn = getattr(rec, "abnormal_count", 0) or 0
+    bp = bp_status(getattr(rec, "systolic", None), getattr(rec, "diastolic", None))
+    return (
+        f"【寶貝機異常通報】\n"
+        f"個案：{rec.user_name}（{rec.id_card}）\n"
+        f"性別/年齡：{rec.gender} / {rec.age or '-'} 歲\n"
+        f"檢測時間：{rec.measure_time or rec.measure_date or '-'}\n"
+        f"身高/體重：{rec.height or '-'} cm / {rec.weight or '-'} kg\n"
+        f"BMI：{rec.bmi if rec.bmi is not None else '-'}\n"
+        f"握力：{rec.grip_strength if rec.grip_strength is not None else '-'} kg\n"
+        f"五次坐站：{rec.chair_stand_time if rec.chair_stand_time is not None else '-'} 秒\n"
+        f"走路時間：{rec.walking_time if rec.walking_time is not None else '-'} 秒\n"
+        f"SMI：{rec.smi if rec.smi is not None else '-'}\n"
+        f"血壓：{rec.systolic or '-'}/{rec.diastolic or '-'} mmHg（{bp}）\n"
+        f"脈搏：{rec.pulse or '-'} bpm\n"
+        f"肌少症分期：{stage}\n"
+        f"異常項目數：{abn}\n"
+        f"說明：{rec.status or '-'}\n"
+        f"請護理師／照顧服務員盡快關懷並記錄處理。"
+    )
+
+
 def normalize_measure_time(raw: Optional[str]) -> Tuple[str, str]:
     """回傳 (measure_date, measure_time)"""
     from datetime import datetime
