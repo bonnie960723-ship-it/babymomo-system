@@ -58,3 +58,4 @@ class AuditLog(Base):
     action = Column(String(100))
     details = Column(Text)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    class Alert
