@@ -642,4 +642,5 @@ def home_page():
     return {"detail": "Frontend not found. Please upload index.html into backend folder."}
 
 if frontend_path:
-    app.mount("/", StaticFiles(directory=frontend_path, html=True), name="frontend")frontend")
+    app.mount("/", StaticFiles(directory=frontend_path, html=True), name="frontend")
+    
