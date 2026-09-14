@@ -618,8 +618,28 @@ def health():
     return {"status": "ok", "service": "寶貝機體適能檢測系統"}
 
 
-# 掛載前端靜態檔（若存在）
 import os
-frontend_path = os.path.join(os.path.dirname(__file__), "..", "frontend")
-if os.path.isdir(frontend_path):
-    app.mount("/", StaticFiles(directory=frontend_path, html=True), name="frontend")
+
+BASE_DIR = os.path.dirname(__file__)
+FRONTEND_CANDIDATES = [
+    os.path.join(BASE_DIR, "frontend"),
+    os.path.join(BASE_DIR, "..", "frontend"),
+    BASE_DIR,
+]
+
+def _find_frontend():
+    for path in FRONTEND_CANDIDATES:
+        if os.path.isfile(os.path.join(path, "index.html")):
+            return path
+    return None
+
+frontend_path = _find_frontend()
+
+@app.get("/")
+def home_page():
+    if frontend_path:
+        return FileResponse(os.path.join(frontend_path, "index.html"))
+    return {"detail": "Frontend not found. Please upload index.html into backend folder."}
+
+if frontend_path:
+    app.mount("/", StaticFiles(directory=frontend_path, html=True), name="frontend")frontend")
