@@ -59,3 +59,24 @@ class AuditLog(Base):
     details = Column(Text)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     class Alert
+    class Alert(Base):
+    __tablename__ = "alerts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    measurement_id = Column(Integer, index=True, nullable=True)
+    id_card = Column(String(20), index=True, nullable=False)
+    user_name = Column(String(50), nullable=False)
+    severity = Column(String(20), default="warning")
+    title = Column(String(200), nullable=False)
+    message = Column(Text, nullable=False)
+    sarcopenia_stage = Column(String(30), nullable=True)
+    abnormal_count = Column(Integer, default=0)
+    target_roles = Column(String(100), default="nurse,caregiver")
+    is_read = Column(Boolean, default=False)
+    read_by = Column(String(50), nullable=True)
+    read_at = Column(DateTime(timezone=True), nullable=True)
+    is_handled = Column(Boolean, default=False)
+    handled_by = Column(String(50), nullable=True)
+    handled_at = Column(DateTime(timezone=True), nullable=True)
+    handle_note = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
