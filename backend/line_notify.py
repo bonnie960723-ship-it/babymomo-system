@@ -1,34 +1,29 @@
-"""LINE Messaging API 推播。
-
-無法用一般 LINE ID（例如 chrischuang1118）直接傳訊。
-需要：
-1. LINE Official Account + Messaging API
-2. Channel access token
-3. 對方加入官方帳號好友後的 userId（U 開頭）
-"""
 import json
 import os
 import urllib.request
 import urllib.error
 
-
 LINE_API = "https://api.line.me/v2/bot/message/push"
 
 
-def line_configured() -> bool:
-    return bool(os.getenv("LINE_CHANNEL_ACCESS_TOKEN") and os.getenv("LINE_USER_ID"))
+def _destinations(to_user=None):
+    dests = []
+    t1 = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
+    u1 = (to_user or os.getenv("LINE_USER_ID", "")).strip()
+    if t1 and u1:
+        dests.append((os.getenv("LINE_OA_ID", "").strip() or "OA1", t1, u1))
+    t2 = os.getenv("LINE_CHANNEL_ACCESS_TOKEN_2", "").strip()
+    u2 = os.getenv("LINE_USER_ID_2", "").strip()
+    if t2 and u2:
+        dests.append((os.getenv("LINE_OA_ID_2", "").strip() or "OA2", t2, u2))
+    return dests
 
 
-def send_line_text(text: str, to_user: str | None = None) -> dict:
-    token = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
-    user_id = (to_user or os.getenv("LINE_USER_ID", "")).strip()
-    if not token or not user_id:
-        return {
-            "ok": False,
-            "simulated": True,
-            "reason": "尚未設定 LINE_CHANNEL_ACCESS_TOKEN 或 LINE_USER_ID",
-            "preview": text,
-        }
+def line_configured():
+    return bool(_destinations())
+
+
+def _push(token, user_id, text):
     body = json.dumps({
         "to": user_id,
         "messages": [{"type": "text", "text": text[:4900]}],
@@ -38,15 +33,29 @@ def send_line_text(text: str, to_user: str | None = None) -> dict:
         data=body,
         headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {token}",
+            "Authorization": "Bearer " + token,
         },
         method="POST",
     )
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
-            return {"ok": True, "simulated": False, "status": resp.status, "preview": text}
+            return {"ok": True, "status": resp.status}
     except urllib.error.HTTPError as e:
-        err = e.read().decode("utf-8", errors="ignore")
-        return {"ok": False, "simulated": False, "status": e.code, "error": err, "preview": text}
+        return {"ok": False, "status": e.code, "error": e.read().decode("utf-8", "ignore")}
     except Exception as e:
-        return {"ok": False, "simulated": False, "error": str(e), "preview": text}
+        return {"ok": False, "error": str(e)}
+
+
+def send_line_text(text, to_user=None):
+    dests = _destinations(to_user)
+    if not dests:
+        return {"ok": False, "simulated": True, "reason": "尚未設定 LINE 變數", "preview": text}
+    results = []
+    all_ok = True
+    for oa, token, user_id in dests:
+        r = _push(token, user_id, text)
+        r["oa"] = oa
+        results.append(r)
+        if not r.get("ok"):
+            all_ok = False
+    return {"ok": all_ok, "simulated": False, "preview": text, "results": results}
