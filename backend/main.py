@@ -842,6 +842,15 @@ def health():
 
 # 掛載前端靜態檔（若存在）
 import os
-frontend_path = os.path.join(os.path.dirname(__file__), "..", "frontend")
+_base = os.path.dirname(__file__)
+frontend_path = _base if os.path.isfile(os.path.join(_base, "index.html")) else os.path.join(_base, "..", "frontend")
+
+@app.get("/")
+def home_page():
+    index_file = os.path.join(frontend_path, "index.html")
+    if os.path.isfile(index_file):
+        return FileResponse(index_file)
+    return {"detail": "Frontend not found"}
+
 if os.path.isdir(frontend_path):
-       app.mount("/", StaticFiles(directory=frontend_path, html=True), name="frontend")
+    app.mount("/", StaticFiles(directory=frontend_path, html=True), name="frontend")
