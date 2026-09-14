@@ -94,17 +94,23 @@ function enterApp() {
     `${currentUser.display_name}（${currentUser.role}）`;
   setRange(90);
   loadStats();
+  loadAlertCount();
   showView("dashboard");
+  // 每 60 秒更新未讀通報數
+  if (!window._alertTimer) {
+    window._alertTimer = setInterval(loadAlertCount, 60000);
+  }
 }
 
 // ---------- Views ----------
 function showView(name) {
-  ["dashboard", "records", "import", "api"].forEach((v) => {
-    document.getElementById(`view-${v}`).style.display = v === name ? "block" : "none";
+  ["dashboard", "records", "alerts", "import", "api"].forEach((v) => {
+    const el = document.getElementById(`view-${v}`);
+    if (el) el.style.display = v === name ? "block" : "none";
   });
   document.querySelectorAll(".sidebar .nav-link").forEach((a) => a.classList.remove("active"));
-  // simple highlight
   if (name === "records") loadRecords();
+  if (name === "alerts") loadAlerts();
 }
 
 // ---------- Stats ----------
@@ -333,3 +339,122 @@ function exportCSV() {
 document.getElementById("loginPassword")?.addEventListener("keydown", (e) => {
   if (e.key === "Enter") doLogin();
 });
+
+
+// ---------- Alerts 異常通報 ----------
+async function loadAlertCount() {
+  try {
+    const data = await api("/api/alerts?only_unhandled=true&page_size=1");
+    const n = data.unhandled || 0;
+    ["alertBadge", "navAlertBadge"].forEach((id) => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      if (n > 0) {
+        el.style.display = "";
+        el.textContent = n > 99 ? "99+" : n;
+      } else {
+        el.style.display = "none";
+      }
+    });
+  } catch (e) {
+    /* ignore */
+  }
+}
+
+async function loadAlerts() {
+  const onlyUnhandled = document.getElementById("alertOnlyUnhandled")?.checked;
+  let url = "/api/alerts?page_size=100";
+  if (onlyUnhandled) url += "&only_unhandled=true";
+  const box = document.getElementById("alertsList");
+  if (!box) return;
+  box.innerHTML = '<div class="text-muted">載入中...</div>';
+  try {
+    const data = await api(url);
+    loadAlertCount();
+    if (!data.items || data.items.length === 0) {
+      box.innerHTML = '<div class="alert alert-success">目前沒有異常通報。</div>';
+      return;
+    }
+    box.innerHTML = data.items.map((a) => {
+      const sevClass = a.severity === "critical" ? "border-danger" : a.severity === "warning" ? "border-warning" : "border-info";
+      const sevBadge = a.severity === "critical" ? "bg-danger" : a.severity === "warning" ? "bg-warning text-dark" : "bg-info";
+      const stageBadge = stageClass(a.sarcopenia_stage);
+      const v = a.vitals || {};
+      const handled = a.is_handled
+        ? `<span class="badge bg-success">已處理 by ${a.handled_by || "-"}</span>`
+        : `<button class="btn btn-sm btn-primary" onclick="handleAlert(${a.id})">標記已關懷處理</button>`;
+      return `<div class="card mb-3 ${sevClass}" style="border-left-width:5px">
+        <div class="card-body">
+          <div class="d-flex justify-content-between align-items-start gap-2 flex-wrap mb-2">
+            <div>
+              <span class="badge ${sevBadge} me-1">${a.severity === "critical" ? "緊急" : a.severity === "warning" ? "注意" : "提醒"}</span>
+              <span class="badge ${stageBadge}">${a.sarcopenia_stage || "-"}</span>
+              <strong class="ms-1">${a.user_name}</strong>
+              <span class="text-muted small">（${a.id_card}）</span>
+              <div class="small text-muted mt-1">${a.created_at ? a.created_at.replace("T", " ").slice(0, 19) : ""} · 異常 ${a.abnormal_count || 0} 項</div>
+            </div>
+            <div class="d-flex gap-2">
+              <button class="btn btn-sm btn-outline-success" onclick="pushAlertLine(${a.id})">傳 LINE</button>
+              ${handled}
+            </div>
+          </div>
+          <div class="row g-2 mb-2">
+            ${vitalCard("握力", v.grip_strength, "kg")}
+            ${vitalCard("五次坐站", v.chair_stand_time, "秒")}
+            ${vitalCard("走路時間", v.walking_time, "秒")}
+            ${vitalCard("SMI", v.smi, "")}
+            ${vitalCard("血壓", (v.systolic && v.diastolic) ? (v.systolic + "/" + v.diastolic) : "-", "mmHg")}
+            ${vitalCard("脈搏", v.pulse, "bpm")}
+            ${vitalCard("BMI", v.bmi, "")}
+            ${vitalCard("身高/體重", (v.height || "-") + " / " + (v.weight || "-"), "cm/kg")}
+          </div>
+          <div class="small" style="white-space:pre-line">${a.message || ""}</div>
+          ${a.handle_note ? `<div class="small text-success mt-2">處理備註：${a.handle_note}</div>` : ""}
+        </div>
+      </div>`;
+    }).join("");
+  } catch (e) {
+    box.innerHTML = `<div class="alert alert-danger">${e.message}</div>`;
+  }
+}
+
+function vitalCard(label, value, unit) {
+  const shown = (value === undefined || value === null || value === "") ? "-" : value;
+  return `<div class="col-6 col-md-3"><div class="metric-card"><div class="text-muted small">${label}</div><div class="fw-semibold">${shown} <span class="small text-muted">${unit || ""}</span></div></div></div>`;
+}
+
+async function handleAlert(id) {
+  const note = prompt("處理說明（可留空）：", "已關懷個案並紀錄");
+  if (note === null) return;
+  try {
+    await api(`/api/alerts/${id}/handle?note=${encodeURIComponent(note)}`, { method: "POST" });
+    loadAlerts();
+  } catch (e) {
+    alert(e.message);
+  }
+}
+
+async function pushAlertLine(id) {
+  try {
+    const r = await api(`/api/alerts/${id}/line`, { method: "POST" });
+    alert(r.ok ? "已送出 LINE" : (r.reason || r.error || "尚未設定 LINE，僅產生預覽"));
+  } catch (e) {
+    alert(e.message);
+  }
+}
+
+async function sendLineTest() {
+  const box = document.getElementById("lineTestResult");
+  if (box) box.innerHTML = '<div class="alert alert-info">傳送中...</div>';
+  try {
+    const r = await api("/api/alerts/line-test", { method: "POST" });
+    const preview = (r.preview || "").replace(/</g, "&lt;");
+    if (r.ok) {
+      box.innerHTML = `<div class="alert alert-success">已送到 LINE。<pre class="mb-0 mt-2 small">${preview}</pre></div>`;
+    } else {
+      box.innerHTML = `<div class="alert alert-warning"><strong>目前是模擬預覽，還沒真正送到你的 LINE。</strong><br>${r.note || r.reason || ""}<pre class="mb-0 mt-2 small">${preview}</pre></div>`;
+    }
+  } catch (e) {
+    if (box) box.innerHTML = `<div class="alert alert-danger">${e.message}</div>`;
+  }
+}
