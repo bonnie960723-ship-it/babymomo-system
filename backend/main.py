@@ -57,7 +57,7 @@ def on_startup():
             ("bonnie", "Aa960723", "Bonnie (系統管理員)", "superadmin", "Bonnie960723@gmail.com"),
                       ("ittlethanks", "Aa0610", "館管理員", "admin", None),
         ]
-        allowed =if old.username not in {"bonnie", "chrisavicii", "ittlethanks", "nurse1", "care1"}:
+        if old.username not in {"bonnie", "chrisavicii", "ittlethanks", "nurse1", "care1"}:
         for username, pwd, display, role, email in defaults:
             existing = get_user_by_username(db, username)
             if existing:
