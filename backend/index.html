@@ -72,6 +72,10 @@
       <i class="bi bi-heart-pulse-fill me-2"></i>寶貝機 體適能檢測系統
     </span>
     <div class="d-flex align-items-center gap-3 text-white">
+      <button class="btn btn-outline-warning btn-sm position-relative me-2" onclick="showView('alerts')" title="異常通報">
+        <i class="bi bi-bell"></i>
+        <span id="navAlertBadge" class="position-absolute top-0 start-100 translate-middle badge rounded-pill bg-danger" style="display:none">0</span>
+      </button>
       <span id="navUser" class="small"></span>
       <button class="btn btn-outline-light btn-sm" onclick="doLogout()">登出</button>
     </div>
@@ -86,6 +90,10 @@
         </a>
         <a class="nav-link" href="#" onclick="showView('records'); return false;">
           <i class="bi bi-table me-2"></i>檢測紀錄
+        </a>
+        <a class="nav-link" href="#" onclick="showView('alerts'); return false;">
+          <i class="bi bi-bell me-2"></i>異常通報
+          <span id="alertBadge" class="badge bg-danger ms-1" style="display:none">0</span>
         </a>
         <a class="nav-link" href="#" onclick="showView('import'); return false;">
           <i class="bi bi-cloud-upload me-2"></i>匯入資料
@@ -189,6 +197,26 @@
             </div>
           </div>
         </div>
+      </div>
+
+      <!-- Alerts -->
+      <div id="view-alerts" style="display:none">
+        <div class="d-flex flex-wrap gap-2 mb-3 align-items-center">
+          <h5 class="mb-0 fw-bold me-2"><i class="bi bi-bell me-1"></i>異常通報中心</h5>
+          <button class="btn btn-sm btn-outline-primary" onclick="loadAlerts()">重新整理</button>
+          <button class="btn btn-sm btn-outline-success" onclick="sendLineTest()">
+            <i class="bi bi-line me-1"></i>傳送模擬資料到 LINE
+          </button>
+          <div class="form-check form-check-inline ms-2">
+            <input class="form-check-input" type="checkbox" id="alertOnlyUnhandled" checked onchange="loadAlerts()">
+            <label class="form-check-label small" for="alertOnlyUnhandled">只看未處理</label>
+          </div>
+        </div>
+        <div class="alert alert-light border small mb-3">
+          當個案出現握力不足、坐站偏慢、步速偏慢、SMI 偏低或血壓異常時，會自動出現在這裡，並列出該次完整身體數據。
+        </div>
+        <div id="lineTestResult" class="mb-3"></div>
+        <div id="alertsList"></div>
       </div>
 
       <!-- Import -->
