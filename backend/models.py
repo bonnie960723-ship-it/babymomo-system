@@ -58,8 +58,6 @@ class AuditLog(Base):
     action = Column(String(100))
     details = Column(Text)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
-  class Alert(Base):
-    class Alert(Base):
     __tablename__ = "alerts"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -80,4 +78,4 @@ class AuditLog(Base):
     handled_at = Column(DateTime(timezone=True), nullable=True)
     handle_note = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
-class Alert(Base):
+
