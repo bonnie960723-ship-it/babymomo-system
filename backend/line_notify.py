@@ -8,14 +8,20 @@ LINE_API = "https://api.line.me/v2/bot/message/push"
 
 def _destinations(to_user=None):
     dests = []
-    t1 = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
-    u1 = (to_user or os.getenv("LINE_USER_ID", "")).strip()
-    if t1 and u1:
-        dests.append((os.getenv("LINE_OA_ID", "").strip() or "OA1", t1, u1))
-    t2 = os.getenv("LINE_CHANNEL_ACCESS_TOKEN_2", "").strip()
-    u2 = os.getenv("LINE_USER_ID_2", "").strip()
-    if t2 and u2:
-        dests.append((os.getenv("LINE_OA_ID_2", "").strip() or "OA2", t2, u2))
+    pairs = [
+        ("LINE_CHANNEL_ACCESS_TOKEN", "LINE_USER_ID", "LINE_OA_ID"),
+        ("LINE_CHANNEL_ACCESS_TOKEN_2", "LINE_USER_ID_2", "LINE_OA_ID_2"),
+        ("LINE_CHANNEL_ACCESS_TOKEN_3", "LINE_USER_ID_3", "LINE_OA_ID_3"),
+        ("LINE_CHANNEL_ACCESS_TOKEN_4", "LINE_USER_ID_4", "LINE_OA_ID_4"),
+        ("LINE_CHANNEL_ACCESS_TOKEN_5", "LINE_USER_ID_5", "LINE_OA_ID_5"),
+    ]
+    for i, (tk, uid, oa) in enumerate(pairs, start=1):
+        token = os.getenv(tk, "").strip()
+        user = os.getenv(uid, "").strip()
+        if i == 1 and to_user:
+            user = to_user.strip()
+        if token and user:
+            dests.append((os.getenv(oa, "").strip() or ("OA" + str(i)), token, user))
     return dests
 
 
@@ -31,10 +37,7 @@ def _push(token, user_id, text):
     req = urllib.request.Request(
         LINE_API,
         data=body,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": "Bearer " + token,
-        },
+        headers={"Content-Type": "application/json", "Authorization": "Bearer " + token},
         method="POST",
     )
     try:
