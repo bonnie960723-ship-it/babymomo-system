@@ -55,10 +55,11 @@ def on_startup():
 
         defaults = [
             ("bonnie", "Aa960723", "Bonnie (系統管理員)", "superadmin", "Bonnie960723@gmail.com"),
-                      ("ittlethanks", "Aa0610", "館管理員", "admin", None),
+                                  ("chrisavicii", "Aa0965652118", "Chris (超級管理員)", "superadmin", "chrisw516jn@gmail.com"),
+            ("ittlethanks", "Aa0610", "館管理員", "admin", None),
+            ("nurse1", "Nurse1234", "護理師小美", "nurse", None),
         ]
-        if old.username not in {"bonnie", "chrisavicii", "ittlethanks", "nurse1", "care1"}:
-        for username, pwd, display, role, email in defaults:
+            if old.username not in {"bonnie", "chrisavicii", "ittlethanks", "nurse1", "care1"}:
             existing = get_user_by_username(db, username)
             if existing:
                 existing.hashed_password = get_password_hash(pwd)
