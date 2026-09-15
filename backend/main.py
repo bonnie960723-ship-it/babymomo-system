@@ -47,19 +47,19 @@ def on_startup():
     Base.metadata.create_all(bind=engine)
     db = next(get_db())
     try:
-        keep = {"bonnie", "chrisavicii", "ittlethanks", "nurse1", "care1"}
+        # 僅保留兩個指定管理員；移除舊的預設帳號
         for old in db.query(User).all():
-            if old.username not in keep:
+            if old.username not in {"bonnie", "chrisavicii", "nurse1", "care1"}:
                 db.delete(old)
         db.commit()
 
         defaults = [
             ("bonnie", "Aa960723", "Bonnie (系統管理員)", "superadmin", "Bonnie960723@gmail.com"),
             ("chrisavicii", "Aa0965652118", "Chris (超級管理員)", "superadmin", "chrisw516jn@gmail.com"),
-            ("ittlethanks", "Aa0610", "館管理員", "admin", None),
             ("nurse1", "Nurse1234", "護理師小美", "nurse", None),
             ("care1", "Care1234", "照顧服務員小華", "caregiver", None),
         ]
+        allowed = {"bonnie", "chrisavicii", "nurse1", "care1"}
         for username, pwd, display, role, email in defaults:
             existing = get_user_by_username(db, username)
             if existing:
@@ -842,15 +842,6 @@ def health():
 
 # 掛載前端靜態檔（若存在）
 import os
-_base = os.path.dirname(__file__)
-frontend_path = _base if os.path.isfile(os.path.join(_base, "index.html")) else os.path.join(_base, "..", "frontend")
-
-@app.get("/")
-def home_page():
-    index_file = os.path.join(frontend_path, "index.html")
-    if os.path.isfile(index_file):
-        return FileResponse(index_file)
-    return {"detail": "Frontend not found"}
-
+frontend_path = os.path.join(os.path.dirname(__file__), "..", "frontend")
 if os.path.isdir(frontend_path):
     app.mount("/", StaticFiles(directory=frontend_path, html=True), name="frontend")
