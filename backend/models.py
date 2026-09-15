@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, Boolean, Text, ForeignKey, Index
+from sqlalchemy import Column, Integer, String, Float, DateTime, Boolean, Text, Index
 from sqlalchemy.sql import func
 from database import Base
 
@@ -81,3 +81,29 @@ class Alert(Base):
     handled_at = Column(DateTime(timezone=True), nullable=True)
     handle_note = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class CareNote(Base):
+    """關懷追蹤紀錄"""
+    __tablename__ = "care_notes"
+
+    id = Column(Integer, primary_key=True, index=True)
+    id_card = Column(String(20), index=True, nullable=False)
+    user_name = Column(String(50), nullable=True)
+    alert_id = Column(Integer, index=True, nullable=True)
+    note_type = Column(String(30), default="followup")
+    content = Column(Text, nullable=False)
+    next_follow_date = Column(String(10), nullable=True)
+    created_by = Column(String(50))
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class SystemConfig(Base):
+    """系統設定（異常門檻等）"""
+    __tablename__ = "system_config"
+
+    id = Column(Integer, primary_key=True, index=True)
+    key = Column(String(50), unique=True, index=True, nullable=False)
+    value = Column(Text, nullable=False)
+    updated_by = Column(String(50), nullable=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
