@@ -109,4 +109,5 @@ class ImportResult(BaseModel):
     success: int
     skipped: int
     failed: int
+    deleted: int = 0
     messages: List[str]
