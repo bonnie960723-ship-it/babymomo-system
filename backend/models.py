@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, Boolean, Text, ForeignKey, Index
+from sqlalchemy import Column, Integer, String, Float, DateTime, Boolean, Text, Index
 from sqlalchemy.sql import func
 from database import Base
 
@@ -80,4 +80,82 @@ class Alert(Base):
     handled_by = Column(String(50), nullable=True)
     handled_at = Column(DateTime(timezone=True), nullable=True)
     handle_note = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class CareNote(Base):
+    """關懷追蹤紀錄"""
+    __tablename__ = "care_notes"
+
+    id = Column(Integer, primary_key=True, index=True)
+    id_card = Column(String(20), index=True, nullable=False)
+    user_name = Column(String(50), nullable=True)
+    alert_id = Column(Integer, index=True, nullable=True)
+    note_type = Column(String(30), default="followup")  # followup / phone / referral / retest
+    content = Column(Text, nullable=False)
+    next_follow_date = Column(String(10), nullable=True)
+    created_by = Column(String(50))
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class SystemConfig(Base):
+    """系統設定（異常門檻等）"""
+    __tablename__ = "system_config"
+
+    id = Column(Integer, primary_key=True, index=True)
+    key = Column(String(50), unique=True, index=True, nullable=False)
+    value = Column(Text, nullable=False)
+    updated_by = Column(String(50), nullable=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class Feedback(Base):
+    """意見／錯誤回饋"""
+    __tablename__ = "feedbacks"
+
+    id = Column(Integer, primary_key=True, index=True)
+    category = Column(String(30), default="suggestion", index=True)  # suggestion / bug / other
+    title = Column(String(200), nullable=True)
+    content = Column(Text, nullable=False)
+    contact = Column(String(120), nullable=True)
+    page_url = Column(String(300), nullable=True)
+    created_by = Column(String(50), nullable=True)
+    created_by_name = Column(String(100), nullable=True)
+    line_sent = Column(Boolean, default=False)
+    line_result = Column(Text, nullable=True)
+    is_handled = Column(Boolean, default=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class CaseEquipmentPlan(Base):
+    """個案客製化運動輔具建議（每人一組，非群體共用）"""
+    __tablename__ = "case_equipment_plans"
+
+    id = Column(Integer, primary_key=True, index=True)
+    id_card = Column(String(20), unique=True, index=True, nullable=False)
+    user_name = Column(String(50), nullable=True)
+    # JSON list: [{name, why, how, caution}, ...]
+    items_json = Column(Text, nullable=False, default="[]")
+    note = Column(Text, nullable=True)
+    updated_by = Column(String(50), nullable=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class SystemIssue(Base):
+    """系統自動健檢發現的問題（可自動排除或待管理員處理）"""
+    __tablename__ = "system_issues"
+
+    id = Column(Integer, primary_key=True, index=True)
+    issue_type = Column(String(50), index=True, nullable=False)
+    severity = Column(String(20), default="warning")
+    title = Column(String(200), nullable=False)
+    detail = Column(Text, nullable=True)
+    related_id = Column(String(50), nullable=True)
+    fingerprint = Column(String(120), index=True, nullable=True)
+    auto_fixed = Column(Boolean, default=False)
+    status = Column(String(20), default="open", index=True)  # open / fixed / ignored
+    resolved_by = Column(String(50), nullable=True)
+    resolved_at = Column(DateTime(timezone=True), nullable=True)
+    resolve_note = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
