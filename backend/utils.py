@@ -185,27 +185,84 @@ def format_alert_message(rec) -> str:
     )
 
 
-def normalize_measure_time(raw: Optional[str]) -> Tuple[str, str]:
-    """回傳 (measure_date, measure_time)"""
-    from datetime import datetime
-    if not raw:
+def normalize_measure_time(raw) -> Tuple[str, str]:
+    """
+    解析 Excel／CSV 的檢測時間，回傳 (measure_date, measure_time)。
+    支援 datetime/date、字串、Excel 序號、民國年；檔案有日期就用檔案的。
+    """
+    from datetime import datetime, date, time as dtime, timedelta
+
+    if raw is None or (isinstance(raw, str) and not str(raw).strip()):
         now = datetime.now()
         return now.strftime("%Y-%m-%d"), now.strftime("%Y-%m-%d %H:%M:%S")
 
-    raw = str(raw).strip().replace("/", "-")
+    if isinstance(raw, datetime):
+        return raw.strftime("%Y-%m-%d"), raw.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(raw, date) and not isinstance(raw, datetime):
+        return raw.strftime("%Y-%m-%d"), raw.strftime("%Y-%m-%d") + " 00:00:00"
+    if isinstance(raw, dtime):
+        now = datetime.now()
+        return now.strftime("%Y-%m-%d"), f"{now.strftime('%Y-%m-%d')} {raw.strftime('%H:%M:%S')}"
+
+    # Excel 序號（約 30000～60000 才是 1982～2064 年）；小數值當秒數不解析
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        n = float(raw)
+        if n >= 20000:
+            try:
+                base = datetime(1899, 12, 30)
+                dt = base + timedelta(days=n)
+                if 1990 <= dt.year <= 2100:
+                    return dt.strftime("%Y-%m-%d"), dt.strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                pass
+
+    s = str(raw).strip()
+    s = s.replace("年", "-").replace("月", "-").replace("日", " ")
+    s = s.replace("/", "-").replace(".", "-")
+    s = " ".join(s.split())
+
+    # 民國年 113-05-15 → 2024-05-15
+    try:
+        parts = s.split(" ", 1)
+        dp = parts[0].split("-")
+        if len(dp) >= 3 and len(dp[0]) <= 3:
+            y = int(dp[0])
+            if 1 <= y <= 200:
+                y += 1911
+                date_part = f"{y:04d}-{int(dp[1]):02d}-{int(dp[2]):02d}"
+                s = (date_part + (" " + parts[1] if len(parts) > 1 else "")).strip()
+    except Exception:
+        pass
+
     for fmt in (
         "%Y-%m-%d %H:%M:%S",
         "%Y-%m-%d %H:%M",
         "%Y-%m-%d",
-        "%Y/%m/%d %H:%M:%S",
-        "%Y/%m/%d",
+        "%Y-%m-%d %H:%M:%S.%f",
+        "%Y%m%d %H%M%S",
+        "%Y%m%d",
+        "%m-%d-%Y %H:%M:%S",
+        "%m-%d-%Y",
+        "%d-%m-%Y %H:%M:%S",
+        "%d-%m-%Y",
     ):
         try:
-            dt = datetime.strptime(raw, fmt)
+            dt = datetime.strptime(s, fmt)
             return dt.strftime("%Y-%m-%d"), dt.strftime("%Y-%m-%d %H:%M:%S")
         except ValueError:
             continue
-    # fallback
+
+    if len(s) >= 8:
+        try:
+            dt = datetime.strptime(s[:10], "%Y-%m-%d")
+            return dt.strftime("%Y-%m-%d"), dt.strftime("%Y-%m-%d") + " 00:00:00"
+        except ValueError:
+            try:
+                dt = datetime.strptime(s[:8], "%Y%m%d")
+                return dt.strftime("%Y-%m-%d"), dt.strftime("%Y-%m-%d") + " 00:00:00"
+            except ValueError:
+                pass
+
     now = datetime.now()
     return now.strftime("%Y-%m-%d"), now.strftime("%Y-%m-%d %H:%M:%S")
 
