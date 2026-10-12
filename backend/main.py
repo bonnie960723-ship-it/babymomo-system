@@ -349,6 +349,11 @@ def add_audit(db: Session, operator: str, action: str, details: str = ""):
 
 
 def create_abnormal_alert(db: Session, rec: Measurement):
+    """
+    建立或更新異常通報。
+    Netown 常分次上傳（血壓→握力→體脂），每次都新建會變成同一人多則通報；
+    改為：同一身分證 + 尚未關懷 → 優先更新同一則，避免洗版。
+    """
     if not rec:
         return None
     stage = rec.sarcopenia_stage or "正常"
@@ -370,25 +375,83 @@ def create_abnormal_alert(db: Session, rec: Measurement):
         advice = "建議：持續觀察，下次檢測時比對趨勢。"
 
     message = format_alert_message(rec) + "\n" + advice
+    day = str(rec.measure_date or "")[:10] or str(rec.measure_time or "")[:10]
+    severity_rank = {"info": 1, "warning": 2, "critical": 3}
 
-    alert = Alert(
-        measurement_id=rec.id,
-        id_card=rec.id_card,
-        user_name=rec.user_name,
-        severity=severity,
-        title=title,
-        message=message,
-        sarcopenia_stage=stage,
-        abnormal_count=abn,
-        target_roles="nurse,caregiver,superadmin,admin",
-    )
-    db.add(alert)
-    db.commit()
-    db.refresh(alert)
+    # 同一人未關懷通報：同 measurement 或同日 → 更新
+    existing = None
     try:
-        send_line_text(message)
+        candidates = (
+            db.query(Alert)
+            .filter(Alert.id_card == rec.id_card, Alert.is_handled == False)  # noqa: E712
+            .order_by(Alert.id.desc())
+            .limit(30)
+            .all()
+        )
+        for a in candidates:
+            if a.measurement_id == rec.id:
+                existing = a
+                break
+        if existing is None:
+            for a in candidates:
+                if day and day in (a.message or ""):
+                    existing = a
+                    break
+        if existing is None and candidates:
+            # 同人短時間內未關懷：合併到最新一則
+            existing = candidates[0]
     except Exception:
-        pass
+        existing = None
+
+    should_line = True
+    if existing:
+        old_rank = severity_rank.get(existing.severity or "", 0)
+        new_rank = severity_rank.get(severity, 0)
+        should_line = new_rank > old_rank
+        existing.measurement_id = rec.id
+        existing.user_name = rec.user_name
+        if new_rank >= old_rank:
+            existing.severity = severity
+            existing.title = title
+        existing.message = message
+        existing.sarcopenia_stage = stage
+        existing.abnormal_count = abn
+        existing.is_read = False
+        db.commit()
+        db.refresh(existing)
+        alert = existing
+        try:
+            for ex in candidates:
+                if ex.id == existing.id:
+                    continue
+                if ex.measurement_id == rec.id or (day and day in (ex.message or "")):
+                    ex.is_handled = True
+                    ex.handled_by = "system"
+                    ex.handle_note = "同日合併通報，已自動結案"
+            db.commit()
+        except Exception:
+            pass
+    else:
+        alert = Alert(
+            measurement_id=rec.id,
+            id_card=rec.id_card,
+            user_name=rec.user_name,
+            severity=severity,
+            title=title,
+            message=message,
+            sarcopenia_stage=stage,
+            abnormal_count=abn,
+            target_roles="nurse,caregiver,superadmin,admin",
+        )
+        db.add(alert)
+        db.commit()
+        db.refresh(alert)
+
+    if should_line:
+        try:
+            send_line_text(message)
+        except Exception:
+            pass
     return alert
 
 
