@@ -5,7 +5,8 @@ let currentPage = 1;
 let currentCaseId = null;
 let dupPage = 1;
 const PAGE_SIZE = 30;
-const VIEWS = ["dashboard", "cases", "records", "duplicates", "alerts", "import", "report", "users", "settings", "audit", "issues", "api", "feedback"];
+const VIEWS = ["dashboard", "cases", "records", "exercises", "duplicates", "alerts", "import", "report", "users", "settings", "audit", "issues", "api", "feedback"];
+let exPage = 1;
 
 async function api(path, options = {}) {
   const headers = options.headers || {};
@@ -56,6 +57,34 @@ function stageClass(stage) {
   if (s.indexOf("前期") >= 0) return "bg-info text-dark";
   if (s === "正常") return "bg-success";
   return "bg-secondary";
+}
+
+/** 伺服器時間多為 UTC，顯示成台灣時間（UTC+8） */
+function fmtTaiwanTime(iso) {
+  if (!iso) return "";
+  try {
+    const s = String(iso).trim();
+    // 已是本機字串 yyyy-mm-dd hh:mm:ss
+    if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(s) && s.indexOf("T") < 0) {
+      return s.slice(0, 19);
+    }
+    const d = new Date(s.endsWith("Z") || /[+-]\d{2}:\d{2}$/.test(s) ? s : s + "Z");
+    if (isNaN(d.getTime())) return s.replace("T", " ").slice(0, 19);
+    const parts = new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Asia/Taipei",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    }).formatToParts(d);
+    const get = (t) => (parts.find((p) => p.type === t) || {}).value || "00";
+    return `${get("year")}-${get("month")}-${get("day")} ${get("hour")}:${get("minute")}:${get("second")}`;
+  } catch (_) {
+    return String(iso).replace("T", " ").slice(0, 19);
+  }
 }
 
 function stageBadge(stage) {
@@ -508,6 +537,80 @@ async function loadDuplicates() {
 function changeDupPage(delta) {
   dupPage = Math.max(1, dupPage + delta);
   loadDuplicates();
+}
+
+const EX_TYPE_LABEL = {
+  ResistanceExercise: "阻力運動",
+  AerobicExercise: "有氧運動",
+  GripTraining: "握力訓練",
+};
+
+async function loadExercises() {
+  const q = (document.getElementById("exQ") || {}).value || "";
+  const start = (document.getElementById("exStart") || {}).value || "";
+  const end = (document.getElementById("exEnd") || {}).value || "";
+  const typ = (document.getElementById("exType") || {}).value || "";
+  let url = `/api/exercises?page=${exPage}&page_size=${PAGE_SIZE}`;
+  if (q.trim()) url += `&q=${encodeURIComponent(q.trim())}`;
+  if (start) url += `&start_date=${start}`;
+  if (end) url += `&end_date=${end}`;
+  if (typ) url += `&exercise_type=${encodeURIComponent(typ)}`;
+  try {
+    const data = await api(url);
+    const tbody = document.getElementById("exBody");
+    if (!tbody) return;
+    tbody.innerHTML = "";
+    (data.items || []).forEach((r) => {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td class="small">${r.measure_time || r.measure_date || "-"}</td>
+        <td class="text-primary small">${r.id_card || "-"}</td>
+        <td>${r.user_name || "-"}</td>
+        <td><span class="badge bg-info text-dark">${EX_TYPE_LABEL[r.exercise_type] || r.exercise_type || "-"}</span></td>
+        <td>${r.machine_name || r.machine_code || "-"}</td>
+        <td>${r.duration_sec != null ? r.duration_sec : "-"}</td>
+        <td>${r.reps != null ? r.reps : "-"}</td>
+        <td>${r.calories != null ? r.calories : "-"}</td>
+        <td>${r.distance_km != null ? r.distance_km : "-"}</td>
+        <td>${r.achievement_rate != null ? r.achievement_rate : "-"}</td>
+        <td class="small text-muted" style="max-width:220px">${r.summary || "-"}</td>
+        <td><button class="btn btn-sm btn-outline-danger" onclick="event.stopPropagation();deleteExercise(${r.id})">刪除</button></td>
+      `;
+      tbody.appendChild(tr);
+    });
+    const info = document.getElementById("exPagerInfo");
+    if (info) info.textContent = `共 ${data.total || 0} 筆 · 第 ${data.page || 1} 頁`;
+  } catch (e) {
+    const msg = document.getElementById("exMsg");
+    if (msg) msg.innerHTML = `<div class="alert alert-danger">${e.message}</div>`;
+    else alert(e.message);
+  }
+}
+
+async function deleteExercise(id) {
+  if (!confirm("確定刪除此筆運動紀錄？")) return;
+  try {
+    await api(`/api/exercises/${id}`, { method: "DELETE" });
+    loadExercises();
+  } catch (e) {
+    alert(e.message);
+  }
+}
+
+async function migrateExerciseFromMeasurements() {
+  if (!confirm("將檢測紀錄中「只有運動、沒有體適能數值」的資料移到運動輔具專區？")) return;
+  const msg = document.getElementById("exMsg");
+  try {
+    if (msg) msg.innerHTML = '<div class="alert alert-info">處理中…</div>';
+    const data = await api("/api/exercises/migrate-from-measurements", { method: "POST" });
+    if (msg) msg.innerHTML = `<div class="alert alert-success">已移動 <strong>${data.moved || 0}</strong> 筆到運動輔具專區</div>`;
+    loadExercises();
+    if (typeof loadRecords === "function") loadRecords();
+    if (typeof loadStats === "function") loadStats();
+  } catch (e) {
+    if (msg) msg.innerHTML = `<div class="alert alert-danger">${e.message}</div>`;
+    else alert(e.message);
+  }
 }
 
 let currentSuggestedRetest = null;
@@ -1113,7 +1216,7 @@ async function loadAlerts() {
               <span class="badge ${stageClass(a.sarcopenia_stage)}">${a.sarcopenia_stage || "-"}</span>
               <strong class="ms-1">${a.user_name}</strong>
               <span class="text-muted small">（${a.id_card}）</span>
-              <div class="small text-muted mt-1">${a.created_at ? a.created_at.replace("T", " ").slice(0, 19) : ""} · 異常 ${a.abnormal_count || 0} 項 · 標準依據：${g === "M" || g === "男" ? "男" : (g === "F" || g === "女" ? "女" : "")}${v.age != null ? " " + v.age + "歲" : ""}</div>
+              <div class="small text-muted mt-1">檢測 ${v.measure_time || a.measure_time || fmtTaiwanTime(a.created_at) || "-"} · 異常 ${a.abnormal_count || 0} 項 · 標準依據：${g === "M" || g === "男" ? "男" : (g === "F" || g === "女" ? "女" : "")}${v.age != null ? " " + v.age + "歲" : ""}</div>
             </div>
             <div class="d-flex gap-2 flex-wrap">
               <button class="btn btn-sm btn-outline-secondary" onclick="goCaseDetail('${a.id_card}')">看個案</button>

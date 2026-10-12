@@ -34,6 +34,10 @@ try:
     from models import SystemIssue
 except Exception:
     SystemIssue = None
+try:
+    from models import ExerciseLog
+except Exception:
+    ExerciseLog = None
 from schemas import (
     UserCreate, UserUpdate, UserOut, Token, MeasurementCreate, MeasurementOut,
     StatsOut, ImportResult, CareNoteCreate, CareNoteOut, ThresholdsOut,
@@ -693,7 +697,49 @@ def handle_netown_upload(body: dict, db: Session, headers: dict) -> JSONResponse
     machine = parsed.get("machine_number") or ""
 
     try:
-        # 同日合併：找同一身分證當日最新一筆，沒有就新建
+        # ----- 運動輔具：寫入 exercise_logs，不占用檢測紀錄 -----
+        if not parsed.get("is_vital") and typ in (
+            "ResistanceExercise", "AerobicExercise", "GripTraining"
+        ):
+            if ExerciseLog is None:
+                return _netown_msg("500", 500)
+            prev = (
+                db.query(Measurement)
+                .filter(Measurement.id_card == id_card)
+                .order_by(Measurement.measure_time.desc())
+                .first()
+            )
+            ex = parsed.get("exercise") or {}
+            log = ExerciseLog(
+                id_card=id_card,
+                user_name=(prev.user_name if prev else id_card),
+                gender=(prev.gender if prev and prev.gender else None),
+                exercise_type=typ,
+                machine_code=ex.get("machine_code"),
+                machine_name=ex.get("machine_name"),
+                duration_sec=ex.get("duration_sec"),
+                reps=ex.get("reps"),
+                calories=ex.get("calories"),
+                distance_km=ex.get("distance_km"),
+                achievement_rate=ex.get("achievement_rate"),
+                extra=ex.get("extra"),
+                summary=(parsed.get("exercise_summary") or "")[:500],
+                measure_date=measure_date,
+                measure_time=measure_time,
+                machine_number=machine,
+                source="netown",
+            )
+            db.add(log)
+            db.commit()
+            add_audit(
+                db,
+                f"netown:{machine}"[:50],
+                "netown_exercise",
+                f"{id_card} type={typ} time={measure_time}",
+            )
+            return _netown_msg("200", 200)
+
+        # ----- 體適能量測：同日合併寫入 measurements -----
         rec = (
             db.query(Measurement)
             .filter(Measurement.id_card == id_card, Measurement.measure_date == measure_date)
@@ -720,7 +766,6 @@ def handle_netown_upload(body: dict, db: Session, headers: dict) -> JSONResponse
             db.add(rec)
             db.flush()
         else:
-            # 更新為較新的量測時間
             if measure_time > (rec.measure_time or ""):
                 rec.measure_time = measure_time
 
@@ -728,18 +773,13 @@ def handle_netown_upload(body: dict, db: Session, headers: dict) -> JSONResponse
             _apply_netown_fields(rec, parsed["fields"])
             _recalc_measurement(db, rec)
 
-        # 運動摘要附加到 status（不覆蓋分期說明主體）
         summary = parsed.get("exercise_summary") or ""
-        if summary:
+        if summary and parsed.get("is_vital"):
             extra = f"[Netown/{typ}] {summary}"
             if rec.status and extra not in (rec.status or ""):
                 rec.status = ((rec.status or "") + " | " + extra)[:500]
             elif not rec.status:
                 rec.status = extra[:500]
-            if not parsed.get("is_vital"):
-                # 純運動紀錄仍確保有分期欄位
-                if not rec.sarcopenia_stage:
-                    _recalc_measurement(db, rec)
 
         db.commit()
         db.refresh(rec)
@@ -1003,6 +1043,147 @@ def delete_measurement(
     db.commit()
     add_audit(db, current_user.username, "delete_measurement", f"id={record_id}")
     return {"ok": True}
+
+
+# ========== 運動輔具紀錄 ==========
+@app.get("/api/exercises", tags=["Exercise"])
+def list_exercises(
+    q: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    exercise_type: Optional[str] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if ExerciseLog is None:
+        return {"total": 0, "page": page, "page_size": page_size, "items": []}
+    query = db.query(ExerciseLog)
+    if q:
+        like = f"%{q}%"
+        query = query.filter(or_(
+            ExerciseLog.id_card.ilike(like),
+            ExerciseLog.user_name.ilike(like),
+            ExerciseLog.machine_name.ilike(like),
+            ExerciseLog.summary.ilike(like),
+        ))
+    if start_date:
+        query = query.filter(ExerciseLog.measure_date >= start_date)
+    if end_date:
+        query = query.filter(ExerciseLog.measure_date <= end_date)
+    if exercise_type:
+        query = query.filter(ExerciseLog.exercise_type == exercise_type)
+    total = query.count()
+    items = (
+        query.order_by(ExerciseLog.measure_time.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+    out = []
+    for r in items:
+        out.append({
+            "id": r.id,
+            "id_card": r.id_card,
+            "user_name": r.user_name,
+            "gender": r.gender,
+            "exercise_type": r.exercise_type,
+            "machine_code": r.machine_code,
+            "machine_name": r.machine_name,
+            "duration_sec": r.duration_sec,
+            "reps": r.reps,
+            "calories": r.calories,
+            "distance_km": r.distance_km,
+            "achievement_rate": r.achievement_rate,
+            "summary": r.summary,
+            "measure_date": r.measure_date,
+            "measure_time": r.measure_time,
+            "machine_number": r.machine_number,
+            "source": r.source,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        })
+    return {"total": total, "page": page, "page_size": page_size, "items": out}
+
+
+@app.delete("/api/exercises/{log_id}", tags=["Exercise"])
+def delete_exercise(
+    log_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles("admin", "superadmin", "company_admin")),
+):
+    if ExerciseLog is None:
+        raise HTTPException(500, "運動紀錄模組未就緒")
+    row = db.query(ExerciseLog).get(log_id)
+    if not row:
+        raise HTTPException(404, "找不到運動紀錄")
+    db.delete(row)
+    db.commit()
+    add_audit(db, current_user.username, "delete_exercise", f"id={log_id}")
+    return {"ok": True}
+
+
+@app.post("/api/exercises/migrate-from-measurements", tags=["Exercise"])
+def migrate_exercise_from_measurements(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles("admin", "superadmin")),
+):
+    """
+    將誤寫入「檢測紀錄」的純運動輔具資料移到運動專區，並自檢測列表移除。
+    判斷：status 含 ResistanceExercise / AerobicExercise / GripTraining，
+    且握力、坐站、走路、SMI、血壓皆空。
+    """
+    if ExerciseLog is None:
+        raise HTTPException(500, "運動紀錄模組未就緒")
+    rows = db.query(Measurement).all()
+    moved = 0
+    for rec in rows:
+        st = rec.status or ""
+        if not any(k in st for k in ("ResistanceExercise", "AerobicExercise", "GripTraining")):
+            continue
+        has_vital = any([
+            rec.grip_strength is not None,
+            rec.chair_stand_time is not None,
+            rec.walking_time is not None,
+            rec.smi is not None,
+            rec.systolic is not None,
+            rec.body_fat is not None,
+        ])
+        if has_vital:
+            continue
+        # 解析類型
+        typ = "ResistanceExercise"
+        if "AerobicExercise" in st:
+            typ = "AerobicExercise"
+        elif "GripTraining" in st:
+            typ = "GripTraining"
+        # 從摘要抽機名
+        machine_name = None
+        for part in st.split("|"):
+            part = part.strip()
+            if "阻力運動" in part or "有氧運動" in part or "握力訓練" in part:
+                machine_name = part.replace("[Netown/ResistanceExercise]", "").replace(
+                    "[Netown/AerobicExercise]", ""
+                ).replace("[Netown/GripTraining]", "").strip()
+                break
+        log = ExerciseLog(
+            id_card=rec.id_card,
+            user_name=rec.user_name,
+            gender=rec.gender,
+            exercise_type=typ,
+            machine_name=(machine_name or typ)[:80],
+            summary=(st[:500] if st else None),
+            measure_date=rec.measure_date,
+            measure_time=rec.measure_time,
+            source=rec.source or "netown",
+            machine_number=(rec.created_by or "").replace("netown:", "")[:50],
+        )
+        db.add(log)
+        db.delete(rec)
+        moved += 1
+    db.commit()
+    add_audit(db, current_user.username, "migrate_exercise", f"moved={moved}")
+    return {"ok": True, "moved": moved}
 
 
 # ========== Import ==========

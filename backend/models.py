@@ -159,3 +159,28 @@ class SystemIssue(Base):
     resolved_at = Column(DateTime(timezone=True), nullable=True)
     resolve_note = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class ExerciseLog(Base):
+    """運動輔具／有氧／握力訓練紀錄（與體適能量測分開）"""
+    __tablename__ = "exercise_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    id_card = Column(String(20), index=True, nullable=False)
+    user_name = Column(String(50), index=True, nullable=True)
+    gender = Column(String(5), nullable=True)
+    exercise_type = Column(String(40), index=True, nullable=False)  # ResistanceExercise / AerobicExercise / GripTraining
+    machine_code = Column(String(20), nullable=True)
+    machine_name = Column(String(80), nullable=True)
+    duration_sec = Column(Float, nullable=True)
+    reps = Column(Float, nullable=True)
+    calories = Column(Float, nullable=True)
+    distance_km = Column(Float, nullable=True)
+    achievement_rate = Column(Float, nullable=True)
+    extra = Column(Text, nullable=True)  # JSON 或摘要
+    summary = Column(String(500), nullable=True)
+    measure_date = Column(String(10), index=True)
+    measure_time = Column(String(19), index=True)
+    machine_number = Column(String(50), nullable=True)
+    source = Column(String(30), default="netown")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
