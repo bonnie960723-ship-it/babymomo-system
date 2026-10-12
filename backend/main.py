@@ -3104,8 +3104,8 @@ def health():
     return {"status": "ok", "service": "寶貝機體適能檢測系統", "version": "2.0.0"}
 
 
-# Frontend static
-_base = os.path.dirname(__file__)
+# Frontend static（明確提供 index.html / app.js，避免 mount 造成 404 無法登入）
+_base = os.path.dirname(os.path.abspath(__file__))
 _candidates = [
     _base,
     os.path.join(_base, "frontend"),
@@ -3118,12 +3118,46 @@ for p in _candidates:
         break
 
 
+def _frontend_file(*names: str) -> Optional[str]:
+    if not frontend_path:
+        return None
+    for name in names:
+        path = os.path.join(frontend_path, name)
+        if os.path.isfile(path):
+            return path
+    return None
+
+
 @app.get("/")
 def home_page():
-    if frontend_path:
-        return FileResponse(os.path.join(frontend_path, "index.html"))
-    return {"detail": "Frontend not found. Upload index.html into backend folder."}
+    path = _frontend_file("index.html")
+    if path:
+        return FileResponse(path, media_type="text/html; charset=utf-8")
+    return HTMLResponse(
+        "<h3>Frontend not found</h3><p>請確認 backend 資料夾內有 index.html 與 app.js</p>",
+        status_code=404,
+    )
 
 
+@app.get("/app.js")
+def serve_app_js():
+    path = _frontend_file("app.js")
+    if path:
+        return FileResponse(path, media_type="application/javascript; charset=utf-8")
+    raise HTTPException(404, "app.js not found — 請將 app.js 放到 backend 目錄")
+
+
+@app.get("/index.html")
+def serve_index_html():
+    path = _frontend_file("index.html")
+    if path:
+        return FileResponse(path, media_type="text/html; charset=utf-8")
+    raise HTTPException(404, "index.html not found")
+
+
+# 其他靜態資源（若有 css/圖片）
 if frontend_path:
-    app.mount("/", StaticFiles(directory=frontend_path, html=True), name="frontend")
+    try:
+        app.mount("/static", StaticFiles(directory=frontend_path), name="frontend_static")
+    except Exception:
+        pass
