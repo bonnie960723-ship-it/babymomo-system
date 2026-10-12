@@ -530,7 +530,7 @@ async function openCase(idCard) {
     const tag = document.getElementById("caseChartTag");
     if (tag) tag.textContent = `個案：${p.user_name}（${masked}）`;
     document.getElementById("btnPrintReport").onclick = () => {
-      window.open(`/api/cases/${encodeURIComponent(idCard)}/report`, "_blank");
+      openCaseReport(true);
     };
 
     const isMale = p.gender === "M";
@@ -857,6 +857,43 @@ function fillSuggestedRetest() {
   }
 }
 
+async function openCaseReport(doPrint) {
+  if (!currentCaseId) return;
+  try {
+    const res = await api(
+      `/api/cases/${encodeURIComponent(currentCaseId)}/report`,
+      { raw: true }
+    );
+    if (!res.ok) {
+      let msg = "無法載入報告";
+      try {
+        const j = await res.json();
+        msg = j.detail || msg;
+      } catch (_) {}
+      throw new Error(msg);
+    }
+    const html = await res.text();
+    const w = window.open("", "_blank");
+    if (!w) {
+      alert("請允許瀏覽器彈出視窗後再試一次");
+      return;
+    }
+    w.document.open();
+    w.document.write(html);
+    w.document.close();
+    if (doPrint) {
+      setTimeout(() => {
+        try {
+          w.focus();
+          w.print();
+        } catch (_) {}
+      }, 400);
+    }
+  } catch (e) {
+    alert(e.message || "開啟報告失敗");
+  }
+}
+
 async function downloadCasePdf() {
   if (!currentCaseId) return;
   try {
@@ -865,7 +902,10 @@ async function downloadCasePdf() {
       `babymomo_${currentCaseId}.pdf`
     );
   } catch (e) {
-    alert(e.message);
+    // 伺服器 PDF 失敗時：開啟報告並引導「另存為 PDF」
+    console.warn("PDF API failed, fallback print", e);
+    alert("將開啟報告視窗，請在列印對話框選擇「另存為 PDF」或「儲存為 PDF」");
+    await openCaseReport(true);
   }
 }
 
@@ -887,8 +927,7 @@ function closeCase() {
 }
 
 function printCaseReport() {
-  if (!currentCaseId) return;
-  window.open(`/api/cases/${encodeURIComponent(currentCaseId)}/report`, "_blank");
+  openCaseReport(true);
 }
 
 async function addCareNote() {
@@ -949,13 +988,16 @@ async function doImport() {
 }
 
 async function doDedupe() {
-  if (!confirm("將掃描並刪除重複檢測紀錄（每組只留最早一筆）。確定嗎？")) return;
+  if (!confirm("將掃描並刪除重複檢測紀錄（同一人同一天只留最新一筆；完全相同的資料也會刪）。確定嗎？")) return;
   const box = document.getElementById("importResult");
   box.innerHTML = '<div class="alert alert-info">審核中...</div>';
   try {
     const data = await api("/api/dedupe", { method: "POST" });
-    box.innerHTML = `<div class="alert alert-success">已刪除重複 <strong>${data.deleted || 0}</strong> 筆</div>`;
+    const msgs = (data.messages || []).slice(0, 8).map(m => `<div class="small text-muted">${m}</div>`).join("");
+    box.innerHTML = `<div class="alert alert-success">已刪除重複 <strong>${data.deleted || 0}</strong> 筆${msgs}</div>`;
     loadStats();
+    if (typeof loadDuplicates === "function") loadDuplicates();
+    if (typeof loadRecords === "function") loadRecords();
   } catch (e) {
     box.innerHTML = `<div class="alert alert-danger">${e.message}</div>`;
   }

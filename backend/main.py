@@ -1,8 +1,8 @@
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Query, status, Body
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Query, status, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, StreamingResponse, HTMLResponse
+from fastapi.responses import FileResponse, StreamingResponse, HTMLResponse, JSONResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import func, or_, desc
 from typing import List, Optional
@@ -274,34 +274,73 @@ def _fp_key(id_card, measure_time, grip, chair, walk, smi, systolic=None):
 
 
 def purge_duplicate_measurements(db: Session) -> tuple:
+    """
+    刪除重複檢測：
+    1) 同一身分證 + 完全相同檢測時間 → 只留一筆（較早 id）
+    2) 同一身分證 + 同一天 + 數值指紋相同 → 只留一筆
+    3) 同一身分證 + 同一天（多筆）→ 只留檢測時間最新的一筆
+       （與列表「隱藏同日舊筆」規則一致，會真正從資料庫刪除）
+    """
     rows = db.query(Measurement).order_by(Measurement.id.asc()).all()
     seen_time = {}
     seen_fp = {}
-    to_delete = []
+    by_day = {}  # (id_card, date) -> list of rec
+    to_delete_ids = set()
+    id_to_rec = {}
+
     for rec in rows:
-        tkey = (_norm_id(rec.id_card), rec.measure_time or "")
-        fkey = _fp_key(
-            rec.id_card, rec.measure_time, rec.grip_strength,
-            rec.chair_stand_time, rec.walking_time, rec.smi, rec.systolic,
+        id_to_rec[rec.id] = rec
+        card = _norm_id(rec.id_card)
+        day = str(rec.measure_date or "")[:10] or str(rec.measure_time or "")[:10]
+        tkey = (card, rec.measure_time or "")
+        # 指紋改為「同一天」為單位，不綁死到秒，避免重匯入只差幾秒就刪不掉
+        fkey = (
+            card,
+            day,
+            _fp_key(
+                rec.id_card, day,  # 用日期代替精確時間
+                rec.grip_strength, rec.chair_stand_time, rec.walking_time,
+                rec.smi, rec.systolic,
+            )[2:],
         )
-        dup = False
+
         if tkey in seen_time:
-            dup = True
+            to_delete_ids.add(rec.id)
         else:
             seen_time[tkey] = rec.id
+
         if fkey in seen_fp:
-            dup = True
+            to_delete_ids.add(rec.id)
         else:
             seen_fp[fkey] = rec.id
-        if dup:
-            to_delete.append(rec)
+
+        by_day.setdefault((card, day), []).append(rec)
+
+    # 同一人同一天：只留 measure_time 最新者
+    for key, group in by_day.items():
+        if len(group) <= 1:
+            continue
+        group_sorted = sorted(
+            group,
+            key=lambda r: (str(r.measure_time or ""), r.id or 0),
+            reverse=True,
+        )
+        keep_id = group_sorted[0].id
+        for r in group_sorted[1:]:
+            to_delete_ids.add(r.id)
+        # 確保最新那筆不會被前面規則誤刪
+        to_delete_ids.discard(keep_id)
+
     names = []
-    for rec in to_delete:
+    for rid in sorted(to_delete_ids):
+        rec = id_to_rec.get(rid)
+        if not rec:
+            continue
         names.append(f"{rec.user_name}/{rec.id_card} @ {rec.measure_time}")
         db.delete(rec)
-    if to_delete:
+    if to_delete_ids:
         db.commit()
-    return len(to_delete), names[:40]
+    return len(to_delete_ids), names[:40]
 
 
 def add_audit(db: Session, operator: str, action: str, details: str = ""):
@@ -353,6 +392,74 @@ def create_abnormal_alert(db: Session, rec: Measurement):
     return alert
 
 
+# ========== 防暴力破解（登入限速）==========
+# 同一帳號或同一 IP 短時間內多次失敗會暫時鎖定
+_login_fail_store: dict = {}  # key -> {"fails": int, "first": ts, "lock_until": ts}
+_LOGIN_MAX_FAILS = 5          # 允許失敗次數
+_LOGIN_WINDOW_SEC = 15 * 60   # 統計視窗 15 分鐘
+_LOGIN_LOCK_SEC = 15 * 60     # 鎖定 15 分鐘
+_LOGIN_IP_MAX = 30            # 同一 IP 15 分鐘內最多嘗試次數（含成功前的失敗）
+
+
+def _client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for") or request.headers.get("X-Forwarded-For")
+    if forwarded:
+        return forwarded.split(",")[0].strip()[:64]
+    real = request.headers.get("x-real-ip") or request.headers.get("X-Real-IP")
+    if real:
+        return real.strip()[:64]
+    if request.client:
+        return (request.client.host or "unknown")[:64]
+    return "unknown"
+
+
+def _login_guard_check(username: str, ip: str) -> Optional[str]:
+    """若應封鎖則回傳錯誤訊息，否則 None。"""
+    now = datetime.now().timestamp()
+    # 清掉過期資料
+    dead = [k for k, v in _login_fail_store.items() if v.get("lock_until", 0) < now and now - v.get("first", 0) > _LOGIN_WINDOW_SEC]
+    for k in dead:
+        _login_fail_store.pop(k, None)
+
+    for key in (f"user:{username.lower()}", f"ip:{ip}"):
+        rec = _login_fail_store.get(key)
+        if not rec:
+            continue
+        lock_until = rec.get("lock_until") or 0
+        if lock_until > now:
+            remain = int(lock_until - now)
+            mins = max(1, (remain + 59) // 60)
+            return f"嘗試次數過多，請約 {mins} 分鐘後再試"
+        # 視窗外則重置
+        if now - rec.get("first", 0) > _LOGIN_WINDOW_SEC:
+            _login_fail_store.pop(key, None)
+    return None
+
+
+def _login_guard_fail(username: str, ip: str):
+    now = datetime.now().timestamp()
+    for key, limit in ((f"user:{username.lower()}", _LOGIN_MAX_FAILS), (f"ip:{ip}", _LOGIN_IP_MAX)):
+        rec = _login_fail_store.get(key)
+        if not rec or now - rec.get("first", 0) > _LOGIN_WINDOW_SEC:
+            rec = {"fails": 0, "first": now, "lock_until": 0}
+        rec["fails"] = int(rec.get("fails", 0)) + 1
+        if rec["fails"] >= limit:
+            rec["lock_until"] = now + _LOGIN_LOCK_SEC
+        _login_fail_store[key] = rec
+
+
+def _login_guard_success(username: str, ip: str):
+    _login_fail_store.pop(f"user:{username.lower()}", None)
+    # IP 不完全清掉，避免換帳號狂試；只在成功時略減
+    rec = _login_fail_store.get(f"ip:{ip}")
+    if rec:
+        rec["fails"] = max(0, int(rec.get("fails", 0)) - 2)
+        if rec["fails"] == 0:
+            _login_fail_store.pop(f"ip:{ip}", None)
+        else:
+            _login_fail_store[f"ip:{ip}"] = rec
+
+
 # ========== Auth ==========
 @app.post("/api/auth/register", response_model=UserOut, tags=["Auth"])
 def register(payload: UserCreate, db: Session = Depends(get_db)):
@@ -360,19 +467,33 @@ def register(payload: UserCreate, db: Session = Depends(get_db)):
 
 
 @app.post("/api/auth/login", response_model=Token, tags=["Auth"])
-def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+def login(
+    request: Request,
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db: Session = Depends(get_db),
+):
     username = (form_data.username or "").strip()
     password = (form_data.password or "").strip()
+    ip = _client_ip(request)
+
+    blocked = _login_guard_check(username or "?", ip)
+    if blocked:
+        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, blocked)
+
     user = get_user_by_username(db, username)
     if not user or not verify_password(password, user.hashed_password):
+        _login_guard_fail(username or "?", ip)
+        # 故意不區分「帳號不存在／密碼錯」，避免被枚舉帳號
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "帳號或密碼錯誤")
     if not user.is_active:
         raise HTTPException(403, "帳號已停用")
+
+    _login_guard_success(user.username, ip)
     token = create_access_token(
         data={"sub": user.username},
         expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
     )
-    add_audit(db, user.username, "login", "登入成功")
+    add_audit(db, user.username, "login", f"登入成功 ip={ip}")
     return Token(access_token=token, user=UserOut.model_validate(user))
 
 
@@ -450,12 +571,186 @@ def update_user(
 
 
 # ========== Measurements ==========
-@app.post("/api/measurements", response_model=MeasurementOut, tags=["Measurements"])
-def create_measurement(
-    payload: MeasurementCreate,
+def _netown_msg(code: str, http_status: int = 200):
+    return JSONResponse(status_code=http_status, content={"MessageCode": str(code)})
+
+
+def _apply_netown_fields(rec: Measurement, fields: dict):
+    """把 Netown 解析出的欄位寫入既有/新建 Measurement。"""
+    mapping = [
+        "height", "weight", "bmi", "body_fat", "smi",
+        "systolic", "diastolic", "pulse",
+        "grip_strength", "chair_stand_time", "walking_time",
+    ]
+    for k in mapping:
+        if k in fields and fields[k] is not None:
+            setattr(rec, k, fields[k])
+
+
+def _recalc_measurement(db: Session, rec: Measurement):
+    if (rec.bmi is None or rec.bmi == 0) and rec.height and rec.weight:
+        rec.bmi = calc_bmi(rec.height, rec.weight)
+    stage, abn_count, status_text = judge_sarcopenia(
+        rec.gender, rec.grip_strength, rec.chair_stand_time,
+        rec.walking_time, rec.smi, age=rec.age,
+    )
+    th = get_thresholds(db)
+    if rec.systolic and rec.systolic >= int(th.get("systolic_high", 140)):
+        if status_text == "各項指標正常":
+            status_text = f"血壓偏高 ({rec.systolic}/{rec.diastolic or '?'})"
+        else:
+            status_text += f" / 血壓偏高 ({rec.systolic}/{rec.diastolic or '?'})"
+        abn_count += 1
+    rec.sarcopenia_stage = stage
+    rec.abnormal_count = abn_count
+    rec.status = status_text
+
+
+def handle_netown_upload(body: dict, db: Session, headers: dict) -> JSONResponse:
+    """處理 NETOWN API v2.4 設備上傳。"""
+    try:
+        from netown import is_netown_payload, parse_netown, netown_api_key_ok
+    except Exception as e:
+        return _netown_msg("500", 500)
+
+    if not netown_api_key_ok(dict(headers)):
+        return _netown_msg("401", 401)
+
+    try:
+        parsed = parse_netown(body)
+    except ValueError:
+        return _netown_msg("400", 400)
+    except Exception:
+        return _netown_msg("500", 500)
+
+    id_card = parsed["id_card"]
+    measure_date = parsed["measure_date"]
+    measure_time = parsed["measure_time"]
+    typ = parsed["type"]
+    machine = parsed.get("machine_number") or ""
+
+    try:
+        # 同日合併：找同一身分證當日最新一筆，沒有就新建
+        rec = (
+            db.query(Measurement)
+            .filter(Measurement.id_card == id_card, Measurement.measure_date == measure_date)
+            .order_by(Measurement.measure_time.desc())
+            .first()
+        )
+        if not rec:
+            prev = (
+                db.query(Measurement)
+                .filter(Measurement.id_card == id_card)
+                .order_by(Measurement.measure_time.desc())
+                .first()
+            )
+            rec = Measurement(
+                id_card=id_card,
+                user_name=(prev.user_name if prev else id_card),
+                gender=(prev.gender if prev and prev.gender else "M"),
+                age=(prev.age if prev else None),
+                measure_date=measure_date,
+                measure_time=measure_time,
+                source="netown",
+                created_by=f"netown:{machine}"[:50],
+            )
+            db.add(rec)
+            db.flush()
+        else:
+            # 更新為較新的量測時間
+            if measure_time > (rec.measure_time or ""):
+                rec.measure_time = measure_time
+
+        if parsed.get("is_vital") and parsed.get("fields"):
+            _apply_netown_fields(rec, parsed["fields"])
+            _recalc_measurement(db, rec)
+
+        # 運動摘要附加到 status（不覆蓋分期說明主體）
+        summary = parsed.get("exercise_summary") or ""
+        if summary:
+            extra = f"[Netown/{typ}] {summary}"
+            if rec.status and extra not in (rec.status or ""):
+                rec.status = ((rec.status or "") + " | " + extra)[:500]
+            elif not rec.status:
+                rec.status = extra[:500]
+            if not parsed.get("is_vital"):
+                # 純運動紀錄仍確保有分期欄位
+                if not rec.sarcopenia_stage:
+                    _recalc_measurement(db, rec)
+
+        db.commit()
+        db.refresh(rec)
+
+        if parsed.get("is_vital"):
+            try:
+                create_abnormal_alert(db, rec)
+            except Exception:
+                pass
+
+        add_audit(
+            db,
+            f"netown:{machine}"[:50],
+            "netown_upload",
+            f"{id_card} type={typ} time={measure_time}",
+        )
+        return _netown_msg("200", 200)
+    except Exception as e:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return _netown_msg("500", 500)
+
+
+@app.post("/api/measurements", tags=["Measurements"])
+async def create_measurement(
+    request: Request,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
 ):
+    """
+    雙格式：
+    1) NETOWN 設備：{ID, MachineNumber, Version, Type, MeasureTime, Values}
+       → 回傳 {MessageCode: 200/400/401/500}，不需登入
+    2) 系統內部：MeasurementCreate JSON + Bearer Token
+       → 回傳 MeasurementOut
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        # 非 JSON：若像 Netown 則 400，否則 422
+        return _netown_msg("400", 400)
+
+    try:
+        from netown import is_netown_payload
+        netown_shape = is_netown_payload(body)
+    except Exception:
+        netown_shape = False
+
+    if netown_shape:
+        return handle_netown_upload(body, db, request.headers)
+
+    # ----- 內部 API（需登入）-----
+    auth = request.headers.get("authorization") or request.headers.get("Authorization") or ""
+    if not auth.lower().startswith("bearer "):
+        raise HTTPException(401, "需要登入")
+    token = auth[7:].strip()
+    current_user = None
+    try:
+        from jose import jwt as jose_jwt
+        from auth import SECRET_KEY, ALGORITHM
+        payload_tok = jose_jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username = payload_tok.get("sub")
+        current_user = get_user_by_username(db, username) if username else None
+    except Exception:
+        current_user = None
+    if current_user is None or not getattr(current_user, "is_active", True):
+        raise HTTPException(401, "登入已過期或無效")
+
+    try:
+        payload = MeasurementCreate(**body)
+    except Exception as e:
+        raise HTTPException(422, f"欄位錯誤：{e}")
+
     measure_date, measure_time = normalize_measure_time(payload.measure_time)
     exists = db.query(Measurement).filter(
         Measurement.id_card == payload.id_card,
@@ -507,6 +802,16 @@ def create_measurement(
     create_abnormal_alert(db, rec)
     add_audit(db, current_user.username, "create_measurement", f"{payload.id_card} {measure_time}")
     return rec
+
+
+@app.post("/api/netown", tags=["Netown"])
+async def netown_endpoint(request: Request, db: Session = Depends(get_db)):
+    """NETOWN 專用別名（與 /api/measurements 相同邏輯）。"""
+    try:
+        body = await request.json()
+    except Exception:
+        return _netown_msg("400", 400)
+    return handle_netown_upload(body, db, request.headers)
 
 
 def _same_day_latest_ids(db: Session) -> set:
@@ -674,30 +979,66 @@ async def import_file(
         raise HTTPException(400, "檔案沒有資料列")
 
     col_map = {
-        "id_card": ["id_card", "身分證", "身分證字號", "id", "idcard"],
-        "user_name": ["user_name", "姓名", "name", "長者姓名"],
+        "id_card": ["id_card", "身分證", "身分證字號", "身分證號", "id", "idcard"],
+        "user_name": ["user_name", "姓名", "name", "長者姓名", "個案姓名"],
         "gender": ["gender", "性別", "sex"],
         "age": ["age", "年齡"],
-        "height": ["height", "身高", "身高cm"],
-        "weight": ["weight", "體重", "體重kg"],
-        "body_fat": ["body_fat", "體脂", "體脂率", "體脂肪"],
-        "smi": ["smi", "肌肉量", "骨骼肌量", "smi_kgm2"],
-        "systolic": ["systolic", "收縮壓", "sbp"],
-        "diastolic": ["diastolic", "舒張壓", "dbp"],
+        "height": ["height", "身高", "身高cm", "身高(cm)"],
+        "weight": ["weight", "體重", "體重kg", "體重(kg)"],
+        "body_fat": ["body_fat", "體脂", "體脂率", "體脂肪", "體脂肪率", "脂肪"],
+        "smi": ["smi", "骨骼肌指數", "smi_kgm2", "骨骼肌量smi"],
+        "muscle_mass": ["肌肉質量", "肌肉量", "骨骼肌量", "除脂肪量"],
+        "systolic": ["systolic", "收縮壓", "sbp", "收縮"],
+        "diastolic": ["diastolic", "舒張壓", "dbp", "舒張"],
         "pulse": ["pulse", "脈搏", "心率", "hr"],
-        "grip_strength": ["grip_strength", "握力", "握力kg"],
-        "chair_stand_time": ["chair_stand_time", "五次坐站", "坐站", "chair"],
-        "walking_time": ["walking_time", "走路時間", "步速", "walk"],
-        "measure_time": ["measure_time", "檢測時間", "量測時間", "時間", "datetime", "date"],
+        "grip_strength": ["grip_strength", "握力", "握力kg", "握力(kg)"],
+        "chair_stand_time": ["chair_stand_time", "五次坐站", "坐站", "chair", "5次坐站", "五次坐立"],
+        "walking_time": ["walking_time", "走路時間", "步速", "walk", "起身行走", "TUG"],
+        # 真正的日期欄優先；「檢測時間」在貴司 Excel 常是秒數，勿當日期
+        "measure_time": [
+            "日期", "檢測日期", "量測日期", "測量日期", "資料日期",
+            "檢驗日期", "評估日期", "施測日期", "datetime", "date",
+            "measure_date", "measured_at", "measure_time",
+            "量測時間", "測量時間", "檢測日時",
+        ],
     }
     sample_keys = list(rows[0].keys())
     lower_cols = {str(c).strip().lower(): str(c).strip() for c in sample_keys}
+    # 也支援欄名含「日期」「時間」的模糊對應
     resolved = {}
     for key, aliases in col_map.items():
         for a in aliases:
             if a.lower() in lower_cols:
                 resolved[key] = lower_cols[a.lower()]
                 break
+    if "measure_time" not in resolved:
+        # 從樣本判斷哪個欄位看起來像日期時間，避開「檢測時間=10」這種秒數欄
+        skip_names = ("走路時間", "坐站", "五次", "握力", "脈搏", "收縮", "舒張")
+        candidates = []
+        for lk, orig in lower_cols.items():
+            if any(s in orig for s in skip_names):
+                continue
+            if any(k in lk for k in ("日期", "date", "datetime", "日時")):
+                candidates.append(orig)
+        if not candidates:
+            for lk, orig in lower_cols.items():
+                if orig in skip_names or "走路" in orig or "坐站" in orig:
+                    continue
+                if any(k in lk for k in ("時間", "time")) and "檢測時間" not in orig:
+                    candidates.append(orig)
+        if candidates:
+            resolved["measure_time"] = candidates[0]
+        else:
+            # 最後才考慮「檢測時間」，且樣本必須像日期
+            for lk, orig in lower_cols.items():
+                if "檢測時間" in orig or lk == "time":
+                    sample = rows[0].get(orig)
+                    md, mt = normalize_measure_time(sample)
+                    if sample is not None and str(sample).strip() and not (
+                        isinstance(sample, (int, float)) and float(sample) < 40000
+                    ) and md and not md.startswith(datetime.now().strftime("%Y-%m-%d")):
+                        resolved["measure_time"] = orig
+                    break
     if "id_card" not in resolved or "user_name" not in resolved:
         raise HTTPException(400, "檔案必須至少包含「身分證」與「姓名」欄位")
 
@@ -706,6 +1047,9 @@ async def import_file(
     seen_in_file_time = set()
     seen_in_file_fp = set()
     th = get_thresholds(db)
+    used_file_date = "measure_time" in resolved
+    if not used_file_date:
+        messages.append("提醒：檔案未找到「檢測日期／時間」欄，將使用匯入當下時間。請確認 Excel 有日期欄。")
 
     for idx, row in enumerate(rows):
         try:
@@ -714,7 +1058,20 @@ async def import_file(
                 if not col:
                     return default
                 val = row.get(col)
-                if val is None or str(val).strip() == "":
+                if val is None:
+                    return default
+                # 保留 datetime／數字給 normalize_measure_time 解析
+                if key == "measure_time":
+                    if isinstance(val, (datetime, )):
+                        return val
+                    from datetime import date as _date
+                    if isinstance(val, _date):
+                        return val
+                    if isinstance(val, (int, float)) and not isinstance(val, bool):
+                        return val
+                    s = str(val).strip()
+                    return s if s else default
+                if str(val).strip() == "":
                     return default
                 return str(val).strip()
 
@@ -746,6 +1103,11 @@ async def import_file(
             chair = to_float(get("chair_stand_time"))
             walk = to_float(get("walking_time"))
             smi = to_float(get("smi"))
+            muscle_mass = to_float(get("muscle_mass"))
+            if smi is None and muscle_mass and height and height > 0:
+                # 骨骼肌指數 SMI = 肌肉質量(kg) / 身高(m)^2
+                hm = height / 100.0
+                smi = round(muscle_mass / (hm * hm), 2)
             systolic = to_int(get("systolic"))
             diastolic = to_int(get("diastolic"))
             pulse = to_int(get("pulse"))
@@ -761,7 +1123,22 @@ async def import_file(
                 messages.append(f"第 {idx+2} 列：收縮壓異常 ({systolic})")
                 continue
 
-            measure_date, measure_time = normalize_measure_time(get("measure_time"))
+            raw_time = get("measure_time")
+            # 「檢測時間」若是 5/10/15 這種秒數，改抓「日期」欄
+            def _looks_like_seconds(v):
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    return 0 <= float(v) < 2000
+                s = str(v or "").strip()
+                try:
+                    return s.isdigit() and int(s) < 2000
+                except Exception:
+                    return False
+            if raw_time is None or _looks_like_seconds(raw_time):
+                for alt in ("日期", "檢測日期", "量測日期", "date", "datetime"):
+                    if alt in row and row.get(alt) not in (None, ""):
+                        raw_time = row.get(alt)
+                        break
+            measure_date, measure_time = normalize_measure_time(raw_time)
             tkey = (_norm_id(id_card), measure_time)
             fkey = _fp_key(id_card, measure_time, grip, chair, walk, smi, systolic)
 
@@ -1210,9 +1587,12 @@ th{{background:#f1f5f9}} .meta{{color:#555;font-size:13px;margin-bottom:16px}}
 .badge{{display:inline-block;padding:2px 8px;border-radius:4px;background:#e2e8f0}}
 .advice{{background:#fef3c7;padding:12px;border-radius:8px;margin-top:12px}}
 .advice ul{{margin:8px 0 0;padding-left:20px}}
-@media print{{button{{display:none}}}}
+@media print{{.no-print{{display:none}}}}
 </style></head><body>
-<button onclick="window.print()">列印</button>
+<div class="no-print" style="margin-bottom:12px">
+  <button onclick="window.print()" style="padding:8px 16px;font-size:14px;cursor:pointer">列印 / 另存 PDF</button>
+  <span style="color:#666;font-size:13px;margin-left:8px">若要存成 PDF：在列印視窗選擇「另存為 PDF」或「Microsoft Print to PDF」</span>
+</div>
 <h1>寶貝機 · 長者體適能檢測報告</h1>
 <div class="meta">產生時間：{datetime.now().strftime("%Y-%m-%d %H:%M")}　操作者：{current_user.display_name}</div>
 <h2>基本資料</h2>
@@ -1241,6 +1621,40 @@ th{{background:#f1f5f9}} .meta{{color:#555;font-size:13px;margin-bottom:16px}}
     return HTMLResponse(html)
 
 
+def _ensure_cjk_font() -> Optional[str]:
+    """尋找或下載可顯示中文的字型，供 PDF 使用。"""
+    candidates = [
+        os.path.join(os.path.dirname(__file__), "fonts", "NotoSansTC-Regular.otf"),
+        "/tmp/NotoSansTC-Regular.otf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        "C:/Windows/Fonts/msjh.ttc",
+        "C:/Windows/Fonts/mingliu.ttc",
+    ]
+    for p in candidates:
+        if p and os.path.isfile(p):
+            return p
+    # 嘗試下載輕量中文字型到 /tmp（僅第一次）
+    dest = "/tmp/NotoSansTC-Regular.otf"
+    urls = [
+        "https://github.com/googlefonts/noto-cjk/raw/main/Sans/OTF/TraditionalChinese/NotoSansTC-Regular.otf",
+        "https://cdn.jsdelivr.net/gh/googlefonts/noto-cjk@main/Sans/OTF/TraditionalChinese/NotoSansTC-Regular.otf",
+    ]
+    try:
+        import urllib.request
+        for url in urls:
+            try:
+                urllib.request.urlretrieve(url, dest)
+                if os.path.isfile(dest) and os.path.getsize(dest) > 100000:
+                    return dest
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+
 # ========== Case PDF Report ==========
 @app.get("/api/cases/{id_card}/report.pdf", tags=["Report"])
 def case_pdf_report(
@@ -1264,43 +1678,43 @@ def case_pdf_report(
     advice = get_exercise_advice(latest.sarcopenia_stage)
     retest = suggested_retest_date(latest.sarcopenia_stage, latest.measure_date)
 
-    font_path = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
-    if not os.path.isfile(font_path):
-        # fallback common paths
-        for p in (
-            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-            "C:/Windows/Fonts/msjh.ttc",
-            "C:/Windows/Fonts/mingliu.ttc",
-        ):
-            if os.path.isfile(p):
-                font_path = p
-                break
-
+    font_path = _ensure_cjk_font()
+    has_cjk = False
     pdf = FPDF()
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
-    try:
-        pdf.add_font("Noto", "", font_path)
-        pdf.set_font("Noto", size=14)
-    except Exception:
+    if font_path:
+        try:
+            pdf.add_font("Noto", "", font_path)
+            pdf.set_font("Noto", size=14)
+            has_cjk = True
+        except Exception:
+            has_cjk = False
+    if not has_cjk:
         pdf.set_font("Helvetica", size=14)
 
     def text(s, size=11):
-        try:
-            pdf.set_font("Noto", size=size)
-        except Exception:
-            pdf.set_font("Helvetica", size=size)
-        pdf.multi_cell(0, 7, str(s) if s is not None else "-")
+        s = "-" if s is None else str(s)
+        if has_cjk:
+            try:
+                pdf.set_font("Noto", size=size)
+                pdf.multi_cell(0, 7, s)
+                return
+            except Exception:
+                pass
+        # 無中文字型時：保留數字與英文，中文改為簡易替代，避免整份失敗
+        pdf.set_font("Helvetica", size=size)
+        safe = s.encode("latin-1", errors="replace").decode("latin-1")
+        pdf.multi_cell(0, 7, safe)
 
     text("寶貝機 · 長者體適能檢測報告", 16)
-    text(f"產生時間：{datetime.now().strftime('%Y-%m-%d %H:%M')}　操作者：{current_user.display_name}", 9)
+    text(f"產生時間：{datetime.now().strftime('%Y-%m-%d %H:%M')}  操作者：{current_user.display_name}", 9)
     pdf.ln(2)
     text("【基本資料】", 12)
     text(
-        f"{latest.user_name}（{latest.id_card}）　{g}　{latest.age or '-'} 歲\n"
-        f"身高 {latest.height or '-'} cm　體重 {latest.weight or '-'} kg　BMI {latest.bmi or '-'}\n"
-        f"最近檢測：{latest.measure_time or '-'}　分期：{latest.sarcopenia_stage or '-'}"
+        f"{latest.user_name} ({latest.id_card})  {g}  {latest.age or '-'} 歲\n"
+        f"身高 {latest.height or '-'} cm  體重 {latest.weight or '-'} kg  BMI {latest.bmi or '-'}\n"
+        f"最近檢測：{latest.measure_time or '-'}  分期：{latest.sarcopenia_stage or '-'}"
     )
     pdf.ln(1)
     text("【最近指標】", 12)
@@ -1309,7 +1723,7 @@ def case_pdf_report(
         f"五次坐站：{latest.chair_stand_time if latest.chair_stand_time is not None else '-'} 秒\n"
         f"走路時間：{latest.walking_time if latest.walking_time is not None else '-'} 秒\n"
         f"SMI：{latest.smi if latest.smi is not None else '-'}\n"
-        f"血壓：{latest.systolic or '-'}/{latest.diastolic or '-'} mmHg　脈搏：{latest.pulse or '-'} bpm\n"
+        f"血壓：{latest.systolic or '-'}/{latest.diastolic or '-'} mmHg  脈搏：{latest.pulse or '-'} bpm\n"
         f"說明：{latest.status or '-'}"
     )
     pdf.ln(1)
